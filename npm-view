@@ -1,0 +1,245 @@
+#!/usr/bin/env node
+
+const fs = require('fs');
+const { execSync } = require('child_process');
+const path = require('path');
+
+// ── colors ────────────────────────────────────────────────────────────────────
+const useColor = process.stdout.isTTY && !process.env.NO_COLOR;
+const c = useColor ? {
+  reset:  '\x1b[0m',
+  bold:   '\x1b[1m',
+  dim:    '\x1b[2m',
+  cyan:   '\x1b[36m',
+  green:  '\x1b[32m',
+  yellow: '\x1b[33m',
+  red:    '\x1b[31m',
+} : Object.fromEntries(['reset','bold','dim','cyan','green','yellow','red'].map(k => [k, '']));
+
+// ── args ──────────────────────────────────────────────────────────────────────
+const args       = process.argv.slice(2);
+const upstream   = args.includes('--upstream');
+const csvMode    = args.includes('--csv');
+const outputIdx  = args.indexOf('--output');
+const outputFile = outputIdx !== -1 ? args[outputIdx + 1] : null;
+const input      = args.find(a => !a.startsWith('--') && args[args.indexOf(a) - 1] !== '--output');
+
+if (!input) {
+  console.error(`${c.red}Usage: npm-view [--upstream] [--csv] [--output <file>] <package.json>${c.reset}`);
+  process.exit(1);
+}
+
+const registryFlag = upstream ? '--registry=https://registry.npmjs.org' : '';
+
+// Detect the configured registry hostname so we can bucket attestation sources
+let configuredRegistryHost = '';
+try {
+  const regUrl = execSync(`npm config get registry ${registryFlag} 2>/dev/null`, { encoding: 'utf8' }).trim();
+  configuredRegistryHost = new URL(regUrl).hostname;
+} catch (_) {}
+
+const pkgJsonPath = path.resolve(input);
+if (!fs.existsSync(pkgJsonPath)) {
+  console.error(`${c.red}File not found: ${pkgJsonPath}${c.reset}`);
+  process.exit(1);
+}
+
+let pkgJson;
+try {
+  pkgJson = JSON.parse(fs.readFileSync(pkgJsonPath, 'utf8'));
+} catch (e) {
+  console.error(`${c.red}Failed to parse ${pkgJsonPath}: ${e.message}${c.reset}`);
+  process.exit(1);
+}
+
+const deps = {
+  ...pkgJson.dependencies,
+  ...pkgJson.devDependencies,
+  ...pkgJson.peerDependencies,
+  ...pkgJson.optionalDependencies,
+};
+
+if (Object.keys(deps).length === 0) {
+  console.log('No dependencies found.');
+  process.exit(0);
+}
+
+// ── output ────────────────────────────────────────────────────────────────────
+const stripAnsi = s => s.replace(/\x1b\[[0-9;]*m/g, '');
+const fileStream = outputFile ? fs.createWriteStream(path.resolve(outputFile)) : null;
+
+function emit(line) {
+  console.log(line);
+  if (fileStream) fileStream.write(stripAnsi(line) + '\n');
+}
+
+function csvField(v) {
+  const s = String(v);
+  return /[,"\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+function emitCsv(fields) {
+  const line = fields.map(csvField).join(',');
+  console.log(line);
+  if (fileStream) fileStream.write(line + '\n');
+}
+
+// ── fetch helpers ─────────────────────────────────────────────────────────────
+function bareVersion(spec) {
+  if (!spec || spec === '*' || spec === 'latest') return 'latest';
+  return spec.replace(/^[\^~>=<v\s]+/, '').split(/\s/)[0];
+}
+
+function queryNpm(name, versionSpec) {
+  const bare  = bareVersion(versionSpec);
+  const parts = bare.split('.');
+  const attempts = [bare];
+  if (parts.length === 3) attempts.push(`${parts[0]}.${parts[1]}`);
+  if (parts.length >= 2) attempts.push(parts[0]);
+
+  for (const v of attempts) {
+    try {
+      const raw = execSync(
+        `npm view "${name}@${v}" --json --loglevel=silent ${registryFlag} 2>/dev/null`,
+        { encoding: 'utf8' }
+      ).trim();
+      if (!raw) continue;
+      let info = JSON.parse(raw);
+      if (Array.isArray(info)) info = info[info.length - 1];
+      return info;
+    } catch (_) {}
+  }
+  return null;
+}
+
+function trunc(str, max) {
+  return str.length <= max ? str : str.slice(0, max - 1) + '…';
+}
+
+// Detect entries that aren't registry packages (local paths, git URLs, etc.)
+function isRegistryPackage(name, versionSpec) {
+  if (/^[./]/.test(name)) return false;
+  if (/^(file:|git\+|git:|github:|bitbucket:|gitlab:|https?:\/\/|[./])/.test(versionSpec)) return false;
+  return true;
+}
+
+// ── layout ────────────────────────────────────────────────────────────────────
+const headers    = ['package', 'version', 'resolved', 'source', 'attestation url', 'provenance'];
+const depEntries = Object.entries(deps);
+
+// table mode: cap fixed columns so one outlier doesn't blow out the whole table
+const nameWidth = Math.min(40, Math.max(headers[0].length, ...depEntries.map(([n]) => n.length)));
+const verWidth  = Math.min(15, Math.max(headers[1].length, ...depEntries.map(([, v]) => v.length)));
+const resWidth  = Math.min(15, Math.max(headers[2].length, ...depEntries.map(([, v]) => bareVersion(v).length)));
+const provWidth = headers[5].length;
+
+const termWidth   = (process.stdout.columns || 120) - 1;
+const sepWidth    = (headers.length - 1) * 2;
+const fixedTotal  = nameWidth + verWidth + resWidth + provWidth;
+const maxUrlWidth = Math.max(15, Math.floor((termWidth - fixedTotal - sepWidth) / 2));
+const totalWidth  = nameWidth + verWidth + resWidth + maxUrlWidth + maxUrlWidth + provWidth + sepWidth;
+const widths      = [nameWidth, verWidth, resWidth, maxUrlWidth, maxUrlWidth, provWidth];
+
+// ── header ────────────────────────────────────────────────────────────────────
+if (csvMode) {
+  emitCsv(headers);
+} else {
+  const last = headers.length - 1;
+  emit(headers.map((h, i) => `${c.bold}${i < last ? h.padEnd(widths[i]) : h}${c.reset}`).join('  '));
+  emit(`${c.dim}${widths.map(w => '─'.repeat(w)).join('  ')}${c.reset}`);
+}
+
+// ── stream rows ───────────────────────────────────────────────────────────────
+let okCount = 0;
+let provCount = 0;
+const sourceBuckets = {}; // hostname → count, '' → no attestation
+
+for (const [name, versionSpec] of depEntries) {
+  if (!isRegistryPackage(name, versionSpec)) {
+    if (csvMode) {
+      emitCsv([name, versionSpec, '', '', '', 'local']);
+    } else {
+      const pkg = `${c.cyan}${trunc(name, widths[0]).padEnd(widths[0])}${c.reset}`;
+      const ver = trunc(versionSpec, widths[1]).padEnd(widths[1]);
+      const res = `${c.dim}${'–'.padEnd(widths[2])}${c.reset}`;
+      const src = `${c.dim}${'–'.padEnd(widths[3])}${c.reset}`;
+      const att = `${c.dim}${'–'.padEnd(widths[4])}${c.reset}`;
+      emit([pkg, ver, res, src, att, `${c.dim}local${c.reset}`].join('  '));
+    }
+    continue;
+  }
+
+  try {
+    const info = queryNpm(name, versionSpec);
+    if (!info) throw new Error('not found');
+
+    const resolved       = info.version || versionSpec;
+    const source         = info?.dist?.tarball || '';
+    const attestations   = info?.dist?.attestations;
+    const attestationUrl = attestations?.url || '';
+    const provenance     = attestations?.provenance ? 'yes' : 'no';
+
+    okCount++;
+    if (provenance === 'yes') provCount++;
+
+    // bucket by attestation source hostname
+    if (attestationUrl) {
+      try {
+        const host = new URL(attestationUrl).hostname;
+        sourceBuckets[host] = (sourceBuckets[host] || 0) + 1;
+      } catch (_) { sourceBuckets['unknown'] = (sourceBuckets['unknown'] || 0) + 1; }
+    } else {
+      sourceBuckets[''] = (sourceBuckets[''] || 0) + 1;
+    }
+
+    if (csvMode) {
+      emitCsv([name, versionSpec, resolved, source, attestationUrl, provenance]);
+    } else {
+      const provColor = provenance === 'yes' ? c.green : c.yellow;
+      const resColor  = resolved !== versionSpec ? c.yellow : '';
+      const pkg  = `${c.cyan}${trunc(name, widths[0]).padEnd(widths[0])}${c.reset}`;
+      const ver  = trunc(versionSpec, widths[1]).padEnd(widths[1]);
+      const res  = `${resColor}${trunc(resolved, widths[2]).padEnd(widths[2])}${resColor ? c.reset : ''}`;
+      const src  = `${c.dim}${trunc(source || 'N/A', widths[3]).padEnd(widths[3])}${c.reset}`;
+      const att  = `${c.dim}${trunc(attestationUrl || 'N/A', widths[4]).padEnd(widths[4])}${c.reset}`;
+      const prov = `${provColor}${provenance}${c.reset}`;
+      emit([pkg, ver, res, src, att, prov].join('  '));
+    }
+  } catch (_) {
+    if (csvMode) {
+      emitCsv([name, versionSpec, 'error', 'error', 'error', 'error']);
+    } else {
+      const pkg  = `${c.cyan}${trunc(name, widths[0]).padEnd(widths[0])}${c.reset}`;
+      const ver  = trunc(versionSpec, widths[1]).padEnd(widths[1]);
+      const rest = widths.slice(2, -1).map(w => `${c.red}${'–'.padEnd(w)}${c.reset}`);
+      emit([pkg, ver, ...rest, `${c.red}–${c.reset}`].join('  '));
+    }
+  }
+}
+
+// ── summary ───────────────────────────────────────────────────────────────────
+const pct      = okCount ? Math.round((provCount / okCount) * 100) : 0;
+const pctColor = pct === 100 ? c.green : pct >= 50 ? c.yellow : c.red;
+
+if (!csvMode) {
+  emit(`${c.dim}${'─'.repeat(totalWidth)}${c.reset}`);
+  emit(`${c.dim}provenance coverage:${c.reset} ${pctColor}${c.bold}${pct}%${c.reset}${c.dim} (${provCount} of ${okCount} packages)${c.reset}`);
+
+  // source breakdown: configured registry · other hosts · none
+  const noneCount = sourceBuckets[''] || 0;
+  const parts = [];
+  for (const [host, count] of Object.entries(sourceBuckets).sort()) {
+    if (!host) continue;
+    const pctH    = okCount ? Math.round((count / okCount) * 100) : 0;
+    const isLocal = host === configuredRegistryHost;
+    const label   = isLocal ? `${c.bold}${host}${c.reset}${c.dim} (your registry)${c.reset}` : `${c.dim}${host}${c.reset}`;
+    parts.push(`${label} ${c.dim}${count} (${pctH}%)${c.reset}`);
+  }
+  if (noneCount) {
+    const pctN = okCount ? Math.round((noneCount / okCount) * 100) : 0;
+    parts.push(`${c.dim}none ${noneCount} (${pctN}%)${c.reset}`);
+  }
+  if (parts.length) emit(`${c.dim}provenance sources: ${c.reset}${parts.join(`${c.dim}  ·  ${c.reset}`)}`);
+}
+
+if (fileStream) fileStream.end();
