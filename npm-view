@@ -25,7 +25,7 @@ const outputFile = outputIdx !== -1 ? args[outputIdx + 1] : null;
 const input      = args.find(a => !a.startsWith('--') && args[args.indexOf(a) - 1] !== '--output');
 
 if (!input) {
-  console.error(`${c.red}Usage: npm-view [--upstream] [--csv] [--output <file>] <package.json>${c.reset}`);
+  console.error(`${c.red}Usage: npm-view [--upstream] [--csv] [--output <file>] <package.json|package-lock.json>${c.reset}`);
   process.exit(1);
 }
 
@@ -52,14 +52,68 @@ try {
   process.exit(1);
 }
 
-const deps = {
-  ...pkgJson.dependencies,
-  ...pkgJson.devDependencies,
-  ...pkgJson.peerDependencies,
-  ...pkgJson.optionalDependencies,
-};
+// ── package extraction ────────────────────────────────────────────────────────
+// Each entry: { name, spec, preVersion?, preResolvedUrl? }
+// preVersion / preResolvedUrl are set when the exact version and tarball URL
+// are already known from a lock file, making registry resolution unnecessary.
 
-if (Object.keys(deps).length === 0) {
+const basename = path.basename(pkgJsonPath);
+const isLockFile = basename === 'package-lock.json' ||
+                   basename === 'npm-shrinkwrap.json' ||
+                   'lockfileVersion' in pkgJson;
+
+function extractLockFileDeps(lockJson) {
+  const seen = new Map(); // `name@version` → entry (deduplicate identical name+version pairs)
+
+  if (lockJson.packages) {
+    // lockfileVersion 2 / 3: flat map of install paths
+    for (const [pkgPath, pkgData] of Object.entries(lockJson.packages)) {
+      if (pkgPath === '') continue;    // root package entry
+      if (pkgData.link) continue;      // workspace symlink
+      // Extract package name from path, e.g.:
+      //   "node_modules/foo"                  → "foo"
+      //   "node_modules/@scope/pkg"           → "@scope/pkg"
+      //   "node_modules/foo/node_modules/bar" → "bar"
+      const lastNM = pkgPath.lastIndexOf('node_modules/');
+      const name = pkgPath.slice(lastNM + 'node_modules/'.length);
+      const version = pkgData.version || '';
+      const key = `${name}@${version}`;
+      if (!seen.has(key)) {
+        seen.set(key, { name, spec: version, preVersion: version, preResolvedUrl: pkgData.resolved || '' });
+      }
+    }
+  } else if (lockJson.dependencies) {
+    // lockfileVersion 1: nested tree
+    function walk(deps) {
+      for (const [name, pkgData] of Object.entries(deps)) {
+        const version = pkgData.version || '';
+        const key = `${name}@${version}`;
+        if (!seen.has(key)) {
+          seen.set(key, { name, spec: version, preVersion: version, preResolvedUrl: pkgData.resolved || '' });
+        }
+        if (pkgData.dependencies) walk(pkgData.dependencies);
+      }
+    }
+    walk(lockJson.dependencies);
+  }
+
+  return [...seen.values()];
+}
+
+let depEntries;
+if (isLockFile) {
+  depEntries = extractLockFileDeps(pkgJson);
+} else {
+  const deps = {
+    ...pkgJson.dependencies,
+    ...pkgJson.devDependencies,
+    ...pkgJson.peerDependencies,
+    ...pkgJson.optionalDependencies,
+  };
+  depEntries = Object.entries(deps).map(([name, spec]) => ({ name, spec }));
+}
+
+if (depEntries.length === 0) {
   console.log('No dependencies found.');
   process.exit(0);
 }
@@ -117,20 +171,20 @@ function trunc(str, max) {
 }
 
 // Detect entries that aren't registry packages (local paths, git URLs, etc.)
-function isRegistryPackage(name, versionSpec) {
+function isRegistryPackage(name, versionSpec, preResolvedUrl = '') {
   if (/^[./]/.test(name)) return false;
   if (/^(file:|git\+|git:|github:|bitbucket:|gitlab:|https?:\/\/|[./])/.test(versionSpec)) return false;
+  if (preResolvedUrl && /^(file:|git\+|git:|github:|bitbucket:|gitlab:)/.test(preResolvedUrl)) return false;
   return true;
 }
 
 // ── layout ────────────────────────────────────────────────────────────────────
 const headers    = ['package', 'version', 'resolved', 'source', 'attestation url', 'provenance'];
-const depEntries = Object.entries(deps);
 
 // table mode: cap fixed columns so one outlier doesn't blow out the whole table
-const nameWidth = Math.min(40, Math.max(headers[0].length, ...depEntries.map(([n]) => n.length)));
-const verWidth  = Math.min(15, Math.max(headers[1].length, ...depEntries.map(([, v]) => v.length)));
-const resWidth  = Math.min(15, Math.max(headers[2].length, ...depEntries.map(([, v]) => bareVersion(v).length)));
+const nameWidth = Math.min(40, Math.max(headers[0].length, ...depEntries.map(e => e.name.length)));
+const verWidth  = Math.min(15, Math.max(headers[1].length, ...depEntries.map(e => e.spec.length)));
+const resWidth  = Math.min(15, Math.max(headers[2].length, ...depEntries.map(e => bareVersion(e.spec).length)));
 const provWidth = headers[5].length;
 
 const termWidth   = (process.stdout.columns || 120) - 1;
@@ -154,8 +208,10 @@ let okCount = 0;
 let provCount = 0;
 const sourceBuckets = {}; // hostname → count, '' → no attestation
 
-for (const [name, versionSpec] of depEntries) {
-  if (!isRegistryPackage(name, versionSpec)) {
+for (const { name, spec, preVersion, preResolvedUrl } of depEntries) {
+  const versionSpec = spec;
+
+  if (!isRegistryPackage(name, versionSpec, preResolvedUrl || '')) {
     if (csvMode) {
       emitCsv([name, versionSpec, '', '', '', 'local']);
     } else {
@@ -170,11 +226,11 @@ for (const [name, versionSpec] of depEntries) {
   }
 
   try {
-    const info = queryNpm(name, versionSpec);
+    const info = queryNpm(name, preVersion || versionSpec);
     if (!info) throw new Error('not found');
 
-    const resolved       = info.version || versionSpec;
-    const source         = info?.dist?.tarball || '';
+    const resolved       = info.version || preVersion || versionSpec;
+    const source         = preResolvedUrl || info?.dist?.tarball || '';
     const attestations   = info?.dist?.attestations;
     const attestationUrl = attestations?.url || '';
     const provenance     = attestations?.provenance ? 'yes' : 'no';

@@ -1,6 +1,6 @@
 # npm-view
 
-A CLI tool that reads a `package.json` file and reports provenance and attestation information for every dependency, querying whichever npm registry you have configured.
+A CLI tool that reads a `package.json` or `package-lock.json` file and reports provenance and attestation information for every dependency, querying whichever npm registry you have configured.
 
 ## Requirements
 
@@ -19,16 +19,19 @@ chmod +x ~/bin/npm-view
 ## Usage
 
 ```
-npm-view [--upstream] [--csv] [--output <file>] <package.json>
+npm-view [--upstream] [--csv] [--output <file>] <package.json|package-lock.json>
 ```
 
 ### Basic
 
 ```
 npm-view package.json
+npm-view package-lock.json
 ```
 
-Reads all dependencies (`dependencies`, `devDependencies`, `peerDependencies`, `optionalDependencies`) from the given `package.json` and queries the registry for each one. Results stream to the terminal as each package resolves.
+**`package.json`** — reads direct dependencies (`dependencies`, `devDependencies`, `peerDependencies`, `optionalDependencies`) and queries the registry for each one.
+
+**`package-lock.json` / `npm-shrinkwrap.json`** — reads the full resolved dependency tree (all packages, not just direct deps). Exact versions and tarball URLs are taken directly from the lock file; the registry is only queried for attestation data. Duplicate entries (same package at the same version installed at multiple paths) are deduplicated. The `version` column shows the pinned exact version.
 
 ### Flags
 
@@ -42,7 +45,7 @@ Flags can appear in any order relative to the filename:
 
 ```
 npm-view --upstream --output report.txt package.json
-npm-view --csv --output report.csv package.json
+npm-view --csv --output report.csv package-lock.json
 npm-view package.json --upstream
 ```
 
